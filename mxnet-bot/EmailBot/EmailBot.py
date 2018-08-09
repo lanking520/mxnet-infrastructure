@@ -15,14 +15,12 @@
 # specific language governing permissions and limitations
 # under the License.
 
-from __future__ import print_function
 from collections import defaultdict
 from botocore.exceptions import ClientError
 from botocore.vendored import requests
 from email.mime.multipart import MIMEMultipart
 from email.mime.image import MIMEImage
 from email.mime.text import MIMEText
-import datetime
 import operator
 import boto3
 import datetime
@@ -60,11 +58,13 @@ class EmailBot:
         self.sender = sender
         self.recipients = [s.strip() for s in recipients.split(",")] if recipients else None
         self.aws_region = aws_region
-        self.elastic_beanstalk_url = elastic_beanstalk_url if elastic_beanstalk_url[-1]!="/" else elastic_beanstalk_url[:-1]
+        self.elastic_beanstalk_url = elastic_beanstalk_url\
+            if elastic_beanstalk_url[-1] != "/" else elastic_beanstalk_url[:-1]
         self.img_file = img_file
         self.open_issues = None
         self.closed_issues = None
-        self.sorted_open_issues = None
+        self.open_pr = None
+        self.closed_pr = None
         self.start = datetime.datetime.strptime("2015-01-01", "%Y-%m-%d")
         self.end = datetime.datetime.today()+datetime.timedelta(days=2)
         self.sla_days = sla_days
@@ -129,17 +129,24 @@ class EmailBot:
         pages = self.__count_pages('issues', 'all')
         open_issues = []
         closed_issues = []
+        open_pr = []
+        closed_pr = []
+
         # nested function to help break out of multiple loops
-        def read_issues(response):
-            for item in response.json():
-                if "pull_request" in item:
-                    continue
+        def read_content(res, issue_op, issue_cl, pr_op, pr_cl):
+            for item in res.json():
                 created = datetime.datetime.strptime(item['created_at'], "%Y-%m-%dT%H:%M:%SZ")
                 if self.start <= created <= self.end:
                     if item['state'] == 'open':
-                        open_issues.append(item)
+                        if "pull_request" in item:
+                            pr_op.append(item)
+                        else:
+                            issue_op.append(item)
                     elif item['state'] == 'closed':
-                        closed_issues.append(item)
+                        if "pull_request" in item:
+                            pr_cl.append(item)
+                        else:
+                            issue_cl.append(item)
                 else:
                     return True
             return False
@@ -154,18 +161,19 @@ class EmailBot:
                                      'direction': 'desc'},
                                     auth=self.auth)
             response.raise_for_status()
-            if read_issues(response):
+            if read_content(response, open_issues, closed_issues, open_pr, closed_pr):
                 break
         self.open_issues = open_issues
         self.closed_issues = closed_issues
+        self.open_pr = open_pr
+        self.closed_pr = closed_pr
 
-    def sort(self):
+    def sort(self, items):
         """
         This method is to sort open issues.
         Returns a dictionary.
         """
-        assert self.open_issues, "No open issues in this time period!"
-        items = self.open_issues
+        assert items, "No open data in this time period!"
         labelled = []
         labelled_urls = ""
         unlabelled = []
@@ -224,18 +232,17 @@ class EmailBot:
                 "outside_sla": outside_sla,
                 "outside_sla_urls": outside_sla_urls,
                 "total_deltas": total_deltas}
-        self.sorted_open_issues = sorted_open_issues
         return sorted_open_issues
 
-    def predict(self):
+    def predict(self, sorted_open_issues):
         """
         This method is to send POST requests to EB web server.
         Then EB web server will send predictions of unlabeled issues back.
         Returns a json:
         ie: [{"number":11919, "predictions":["doc"]}]
         """
-        assert self.sorted_open_issues, "Please sort open issues first"
-        issues = self.sorted_open_issues
+        assert sorted_open_issues, "Please sort open issues first"
+        issues = sorted_open_issues
         unlabeled_issue_number = [item['number'] for item in issues["unlabelled"]]
         logging.info("Start predicting labels for: {}".format(str(unlabeled_issue_number)))
         url = "{}/predict".format(self.elastic_beanstalk_url)
@@ -263,9 +270,9 @@ class EmailBot:
         This method is to generate body html of email content
         """
         self.read_repo(False)
-        all_sorted_open_issues = self.sort()
+        all_sorted_open_issues = self.sort(self.open_issues)
         self.read_repo(True)
-        weekly_sorted_open_issues = self.sort()
+        weekly_sorted_open_issues = self.sort(self.open_issues)
         # draw the pie chart
         all_labels = weekly_sorted_open_issues['labels']
         sorted_labels = sorted(all_labels.items(), key=operator.itemgetter(1), reverse=True)
@@ -299,7 +306,7 @@ class EmailBot:
                     ["List issues without response with 5 days:", all_sorted_open_issues["outside_sla_urls"]]]
         # generate the second html tabel
         htmltable2 = [["<a href='" +"https://github.com/{}/issues/{}".format(self.repo,str(item['number']) ) + "'>" + str(item['number']) + "</a>   ", 
-                       ",".join(item['predictions'])] for item in self.predict()]
+                       ",".join(item['predictions'])] for item in self.predict(weekly_sorted_open_issues)]
         body_html = """<html>
         <head>
         </head>
@@ -307,7 +314,7 @@ class EmailBot:
           <h4>Week: {} to {}</h4>
           <p>{} newly issues were opened in the above period, among which {} were closed and {} are still open.</p>
           <div>{}</div>
-          <p>Here are the recommanded labels for unlabeled issues:</p>
+          <p>Here are the recommended labels for unlabeled issues:</p>
           <div>{}</div>
           <p><img src="cid:image1" width="400" height="400"></p>
         </body>
